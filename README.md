@@ -205,16 +205,10 @@ aws lambda invoke \
   --payload '{}' response.json
 ```
 
-### Automated Testing
-```bash
-# Run the test suite
-./tests/run-tests.sh
-```
-
 ### Disaster Recovery Testing
 ```bash
 # Automated DR test (creates test instance)
-./tests/dr-test.sh --cleanup-after
+./disaster-recovery.sh --interactive
 ```
 
 ## 🔒 Security
@@ -230,18 +224,6 @@ The solution follows least-privilege principles:
 - VPC endpoint compatibility
 - CloudTrail integration for audit trails
 - Secrets Manager integration for notifications
-
-## 🚀 Advanced Use Cases
-
-### Blue-Green Deployments
-Use snapshots as automatic rollback points:
-```bash
-# Before major Jenkins update
-./scripts/create-rollback-snapshot.sh
-
-# If update fails, rollback in 5 minutes
-./scripts/rollback-from-snapshot.sh
-```
 
 ### Compliance Integration
 Built-in support for:
@@ -310,7 +292,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - 💬 [Open an issue](https://github.com/HeinanCA/automatic-jenkinser/issues)
 - 📧 Email: heinancabouly@gmail.com
 - 🐦 Twitter: [@heinanca](https://twitter.com/heinanca)
-- 💼 LinkedIn: [Heinan Cabouly](https://linkedin.com/in/heinan-cabouly)
+- 💼 LinkedIn: [Heinan Cabouly](https://www.linkedin.com/in/heinan-cabouly-41537235)
 
 ---
 

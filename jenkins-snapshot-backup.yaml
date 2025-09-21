@@ -1,0 +1,741 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Jenkins EBS Snapshot Backup Automation (v1.0.0)
+  
+  Production-ready automated Jenkins disaster recovery using AWS EBS snapshots.
+  This infrastructure-first solution eliminates plugin dependencies while providing
+  true disaster recovery capabilities with 5-minute recovery time.
+  
+  Features:
+  - Automated daily EBS snapshots with Lambda
+  - Configurable retention policies
+  - Email notifications via SNS
+  - CloudWatch monitoring and dashboards
+  - Cost optimization with incremental snapshots
+  - Security best practices with least-privilege IAM
+  
+  Repository: https://github.com/your-username/jenkins-ebs-backup-automation
+  Documentation: https://github.com/your-username/jenkins-ebs-backup-automation/docs
+  License: MIT
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Jenkins Configuration"
+        Parameters:
+          - JenkinsInstanceId
+      - Label:
+          default: "Backup Configuration"  
+        Parameters:
+          - RetentionDays
+          - BackupTime
+      - Label:
+          default: "Notification Configuration"
+        Parameters:
+          - NotificationEmail
+    ParameterLabels:
+      JenkinsInstanceId:
+        default: "Jenkins EC2 Instance ID"
+      RetentionDays:
+        default: "Snapshot Retention (Days)"
+      BackupTime:
+        default: "Daily Backup Time (UTC)"
+      NotificationEmail:
+        default: "Email for Notifications"
+
+Parameters:
+  JenkinsInstanceId:
+    Type: String
+    Description: |
+      EC2 Instance ID of your Jenkins server (e.g., i-1234567890abcdef0).
+      The instance must have EBS volumes attached for backup.
+    AllowedPattern: '^i-[0-9a-f]{8,17}$'
+    ConstraintDescription: |
+      Must be a valid EC2 instance ID in the format i-xxxxxxxxxxxxxxxxx
+  
+  RetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+    Description: |
+      Number of days to retain snapshots before automatic deletion.
+      Longer retention periods increase storage costs but provide more recovery options.
+      Recommended: 7-14 days for most use cases.
+  
+  BackupTime:
+    Type: String
+    Default: '02:00'
+    Description: |
+      Daily backup time in UTC using 24-hour format (HH:MM).
+      Recommended: Schedule during off-peak hours to minimize impact.
+      Examples: 02:00, 14:30, 23:45
+    AllowedPattern: '^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$'
+    ConstraintDescription: |
+      Must be in HH:MM format (24-hour). Examples: 02:00, 14:30, 23:45
+  
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: |
+      (Optional) Email address for backup notifications.
+      You will receive notifications for backup success, failures, and cleanup operations.
+      Leave empty to disable notifications.
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: |
+      Must be a valid email address or empty
+
+Conditions:
+  CreateNotifications: !Not [!Equals [!Ref NotificationEmail, '']]
+
+Resources:
+  #============================================================================
+  # IAM ROLE - Lambda Execution Role with Least Privilege
+  #============================================================================
+  
+  JenkinsBackupLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-jenkins-backup-lambda-role'
+      Description: 'IAM role for Jenkins backup Lambda function with least-privilege permissions'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: JenkinsSnapshotManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # EC2 permissions for snapshot operations
+              - Effect: Allow
+                Action:
+                  - ec2:CreateSnapshot
+                  - ec2:DeleteSnapshot
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVolumes
+                  - ec2:CreateTags
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'ec2:Region': !Ref 'AWS::Region'
+              # SNS permissions for notifications (conditional)
+              - !If
+                - CreateNotifications
+                - Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref BackupNotificationTopic
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Purpose
+          Value: Jenkins-Backup-Automation
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Repository
+          Value: jenkins-ebs-backup-automation
+
+  #============================================================================
+  # SNS TOPIC - Email Notifications (Conditional)
+  #============================================================================
+  
+  BackupNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNotifications
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-jenkins-backup-notifications'
+      DisplayName: 'Jenkins Backup Notifications'
+      Description: 'Notifications for Jenkins EBS snapshot backup operations'
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+      Tags:
+        - Key: Purpose
+          Value: Jenkins-Backup-Automation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  #============================================================================
+  # LAMBDA FUNCTION - Core Backup Logic
+  #============================================================================
+  
+  JenkinsBackupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-jenkins-backup'
+      Description: 'Automated Jenkins EBS snapshot backup with intelligent cleanup and notifications'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt JenkinsBackupLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrencyLimit: 1
+      Environment:
+        Variables:
+          JENKINS_INSTANCE_ID: !Ref JenkinsInstanceId
+          RETENTION_DAYS: !Ref RetentionDays
+          SNS_TOPIC_ARN: !If [CreateNotifications, !Ref BackupNotificationTopic, '']
+          STACK_NAME: !Ref 'AWS::StackName'
+          LOG_LEVEL: 'INFO'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import logging
+          from datetime import datetime, timedelta
+          from typing import List, Dict, Any, Optional
+          
+          # Configure logging
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logging.basicConfig(
+              level=getattr(logging, log_level),
+              format='%(asctime)s - %(levelname)s - %(message)s'
+          )
+          logger = logging.getLogger(__name__)
+
+          # Initialize AWS clients
+          ec2_client = boto3.client('ec2')
+          sns_client = boto3.client('sns') if os.environ.get('SNS_TOPIC_ARN') else None
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Main Lambda handler for Jenkins EBS snapshot backup automation.
+              
+              This function:
+              1. Discovers all EBS volumes attached to the Jenkins instance
+              2. Creates snapshots with intelligent tagging
+              3. Cleans up old snapshots based on retention policy
+              4. Sends notifications on success/failure
+              
+              Args:
+                  event: Lambda event data (unused)
+                  context: Lambda context object
+                  
+              Returns:
+                  Dict with statusCode and execution details
+              """
+              
+              instance_id = os.environ['JENKINS_INSTANCE_ID']
+              retention_days = int(os.environ['RETENTION_DAYS'])
+              sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+              stack_name = os.environ.get('STACK_NAME', 'jenkins-backup')
+              
+              logger.info(f"Starting backup process for instance: {instance_id}")
+              logger.info(f"Retention policy: {retention_days} days")
+              
+              try:
+                  # Step 1: Validate instance and get volume information
+                  volumes = get_instance_volumes(instance_id)
+                  if not volumes:
+                      raise ValueError(f"No EBS volumes found for instance {instance_id}")
+                  
+                  logger.info(f"Found {len(volumes)} EBS volumes to backup")
+                  
+                  # Step 2: Create snapshots for each volume
+                  snapshots_created = create_snapshots(volumes, instance_id)
+                  logger.info(f"Created {len(snapshots_created)} snapshots successfully")
+                  
+                  # Step 3: Clean up old snapshots
+                  snapshots_deleted = cleanup_old_snapshots(instance_id, retention_days)
+                  logger.info(f"Cleaned up {snapshots_deleted} old snapshots")
+                  
+                  # Step 4: Send success notification
+                  if sns_client and sns_topic_arn:
+                      send_success_notification(
+                          sns_topic_arn, instance_id, snapshots_created, 
+                          snapshots_deleted, stack_name
+                      )
+                  
+                  # Return success response
+                  response = {
+                      'statusCode': 200,
+                      'body': {
+                          'message': 'Backup completed successfully',
+                          'instance_id': instance_id,
+                          'snapshots_created': len(snapshots_created),
+                          'snapshots_deleted': snapshots_deleted,
+                          'retention_days': retention_days,
+                          'execution_time': datetime.utcnow().isoformat() + 'Z'
+                      }
+                  }
+                  
+                  logger.info("Backup process completed successfully")
+                  return response
+                  
+              except Exception as e:
+                  error_message = f"Jenkins backup failed: {str(e)}"
+                  logger.error(error_message, exc_info=True)
+                  
+                  # Send error notification
+                  if sns_client and sns_topic_arn:
+                      send_error_notification(sns_topic_arn, instance_id, str(e), stack_name)
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': {
+                          'error': error_message,
+                          'instance_id': instance_id,
+                          'execution_time': datetime.utcnow().isoformat() + 'Z'
+                      }
+                  }
+
+          def get_instance_volumes(instance_id: str) -> List[Dict[str, str]]:
+              """
+              Get all EBS volumes attached to the specified EC2 instance.
+              
+              Args:
+                  instance_id: EC2 instance ID
+                  
+              Returns:
+                  List of volume information dictionaries
+              """
+              try:
+                  response = ec2_client.describe_instances(InstanceIds=[instance_id])
+                  
+                  if not response['Reservations']:
+                      raise ValueError(f"Instance {instance_id} not found")
+                  
+                  instance = response['Reservations'][0]['Instances'][0]
+                  volumes = []
+                  
+                  for block_device in instance.get('BlockDeviceMappings', []):
+                      if 'Ebs' in block_device:
+                          volume_id = block_device['Ebs']['VolumeId']
+                          device_name = block_device.get('DeviceName', 'unknown')
+                          
+                          volumes.append({
+                              'VolumeId': volume_id,
+                              'DeviceName': device_name,
+                              'InstanceId': instance_id
+                          })
+                          
+                          logger.debug(f"Found volume: {volume_id} ({device_name})")
+                  
+                  return volumes
+                  
+              except Exception as e:
+                  logger.error(f"Failed to get volumes for instance {instance_id}: {str(e)}")
+                  raise
+
+          def create_snapshots(volumes: List[Dict[str, str]], instance_id: str) -> List[Dict[str, str]]:
+              """
+              Create EBS snapshots for the provided volumes with comprehensive tagging.
+              
+              Args:
+                  volumes: List of volume information
+                  instance_id: EC2 instance ID
+                  
+              Returns:
+                  List of created snapshot information
+              """
+              snapshots_created = []
+              timestamp = datetime.utcnow().strftime('%Y-%m-%d-%H%M%S')
+              
+              for volume_info in volumes:
+                  volume_id = volume_info['VolumeId']
+                  device_name = volume_info['DeviceName']
+                  
+                  try:
+                      # Create snapshot
+                      snapshot_name = f"jenkins-backup-{timestamp}-{volume_id}"
+                      description = f"Automated Jenkins backup - {timestamp} - {device_name}"
+                      
+                      logger.info(f"Creating snapshot for volume {volume_id}")
+                      
+                      response = ec2_client.create_snapshot(
+                          VolumeId=volume_id,
+                          Description=description,
+                          TagSpecifications=[
+                              {
+                                  'ResourceType': 'snapshot',
+                                  'Tags': [
+                                      {'Key': 'Name', 'Value': snapshot_name},
+                                      {'Key': 'Purpose', 'Value': 'Jenkins-Backup'},
+                                      {'Key': 'InstanceId', 'Value': instance_id},
+                                      {'Key': 'VolumeId', 'Value': volume_id},
+                                      {'Key': 'DeviceName', 'Value': device_name},
+                                      {'Key': 'CreatedBy', 'Value': 'Lambda-Automated'},
+                                      {'Key': 'BackupDate', 'Value': timestamp},
+                                      {'Key': 'RetentionDays', 'Value': str(os.environ['RETENTION_DAYS'])},
+                                      {'Key': 'AutomationStack', 'Value': os.environ.get('STACK_NAME', 'jenkins-backup')}
+                                  ]
+                              }
+                          ]
+                      )
+                      
+                      snapshot_id = response['SnapshotId']
+                      snapshots_created.append({
+                          'SnapshotId': snapshot_id,
+                          'VolumeId': volume_id,
+                          'DeviceName': device_name,
+                          'Name': snapshot_name,
+                          'Timestamp': timestamp
+                      })
+                      
+                      logger.info(f"Created snapshot {snapshot_id} for volume {volume_id}")
+                      
+                  except Exception as e:
+                      logger.error(f"Failed to create snapshot for volume {volume_id}: {str(e)}")
+                      raise
+              
+              return snapshots_created
+
+          def cleanup_old_snapshots(instance_id: str, retention_days: int) -> int:
+              """
+              Clean up snapshots older than the retention period.
+              
+              Args:
+                  instance_id: EC2 instance ID
+                  retention_days: Number of days to retain snapshots
+                  
+              Returns:
+                  Number of snapshots deleted
+              """
+              cutoff_date = datetime.utcnow() - timedelta(days=retention_days)
+              deleted_count = 0
+              
+              try:
+                  logger.info(f"Cleaning up snapshots older than {cutoff_date.isoformat()}")
+                  
+                  # Find snapshots to delete
+                  response = ec2_client.describe_snapshots(
+                      OwnerIds=['self'],
+                      Filters=[
+                          {'Name': 'tag:Purpose', 'Values': ['Jenkins-Backup']},
+                          {'Name': 'tag:InstanceId', 'Values': [instance_id]},
+                          {'Name': 'tag:CreatedBy', 'Values': ['Lambda-Automated']}
+                      ]
+                  )
+                  
+                  for snapshot in response['Snapshots']:
+                      # Parse start time (remove timezone info for comparison)
+                      start_time = snapshot['StartTime'].replace(tzinfo=None)
+                      snapshot_id = snapshot['SnapshotId']
+                      
+                      if start_time < cutoff_date:
+                          try:
+                              logger.info(f"Deleting old snapshot: {snapshot_id} (created: {start_time})")
+                              ec2_client.delete_snapshot(SnapshotId=snapshot_id)
+                              deleted_count += 1
+                              
+                          except Exception as e:
+                              logger.warning(f"Failed to delete snapshot {snapshot_id}: {str(e)}")
+                              # Continue with other snapshots even if one fails
+                  
+                  logger.info(f"Cleanup completed. Deleted {deleted_count} old snapshots")
+                  return deleted_count
+                  
+              except Exception as e:
+                  logger.error(f"Error during cleanup: {str(e)}")
+                  # Don't raise exception for cleanup failures - backup is more important
+                  return 0
+
+          def send_success_notification(
+              topic_arn: str, 
+              instance_id: str, 
+              snapshots: List[Dict[str, str]], 
+              deleted_count: int,
+              stack_name: str
+          ) -> None:
+              """Send success notification via SNS."""
+              try:
+                  snapshot_details = '\n'.join([
+                      f"  • {s['Name']} ({s['SnapshotId']})" for s in snapshots
+                  ])
+                  
+                  message = f"""Jenkins Backup Completed Successfully ✅
+
+Instance: {instance_id}
+Stack: {stack_name}
+Timestamp: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
+
+Snapshots Created ({len(snapshots)}):
+{snapshot_details}
+
+Maintenance:
+  • Old snapshots cleaned up: {deleted_count}
+  • Retention policy: {os.environ['RETENTION_DAYS']} days
+
+Next Steps:
+  • Verify snapshots in EC2 Console
+  • Monitor costs in AWS Billing
+  • Test disaster recovery procedures monthly
+
+Dashboard: https://console.aws.amazon.com/cloudwatch/home?region={boto3.Session().region_name}#dashboards:
+"""
+
+                  sns_client.publish(
+                      TopicArn=topic_arn,
+                      Subject=f"✅ Jenkins Backup Success - {datetime.utcnow().strftime('%Y-%m-%d')}",
+                      Message=message
+                  )
+                  
+                  logger.info("Success notification sent")
+                  
+              except Exception as e:
+                  logger.error(f"Failed to send success notification: {str(e)}")
+
+          def send_error_notification(
+              topic_arn: str, 
+              instance_id: str, 
+              error_message: str,
+              stack_name: str
+          ) -> None:
+              """Send error notification via SNS."""
+              try:
+                  message = f"""Jenkins Backup Failed ❌
+
+Instance: {instance_id}
+Stack: {stack_name}
+Error: {error_message}
+Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
+
+Immediate Actions Required:
+  1. Check CloudWatch Logs for detailed error information
+  2. Verify Jenkins instance is running and accessible
+  3. Confirm IAM permissions for snapshot operations
+  4. Check EBS volume status
+
+CloudWatch Logs: https://console.aws.amazon.com/cloudwatch/home?region={boto3.Session().region_name}#logsV2:log-groups/log-group/%252Faws%252Flambda%252F{stack_name}-jenkins-backup
+
+Support: https://github.com/your-username/jenkins-ebs-backup-automation/issues
+"""
+
+                  sns_client.publish(
+                      TopicArn=topic_arn,
+                      Subject=f"❌ Jenkins Backup Failed - {datetime.utcnow().strftime('%Y-%m-%d')}",
+                      Message=message
+                  )
+                  
+                  logger.info("Error notification sent")
+                  
+              except Exception as e:
+                  logger.error(f"Failed to send error notification: {str(e)}")
+
+      Tags:
+        - Key: Purpose
+          Value: Jenkins-Backup-Automation
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Repository
+          Value: jenkins-ebs-backup-automation
+
+  #============================================================================
+  # EVENTBRIDGE RULE - Scheduled Backup Trigger
+  #============================================================================
+  
+  JenkinsBackupSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-jenkins-backup-schedule'
+      Description: 'Daily schedule for automated Jenkins EBS snapshots'
+      State: ENABLED
+      ScheduleExpression: !Sub 
+        - 'cron(${Minutes} ${Hours} * * ? *)'
+        - Minutes: !Select [1, !Split [':', !Ref BackupTime]]
+          Hours: !Select [0, !Split [':', !Ref BackupTime]]
+      Targets:
+        - Arn: !GetAtt JenkinsBackupFunction.Arn
+          Id: JenkinsBackupTarget
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAge: 3600
+      Tags:
+        - Key: Purpose
+          Value: Jenkins-Backup-Automation
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref JenkinsBackupFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt JenkinsBackupSchedule.Arn
+
+  #============================================================================
+  # CLOUDWATCH DASHBOARD - Monitoring and Observability
+  #============================================================================
+  
+  JenkinsBackupDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${JenkinsBackupFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ],
+                  [ ".", "Throttles", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EBS", "VolumeReadOps", "VolumeId", "AUTO" ],
+                  [ ".", "VolumeWriteOps", ".", "." ],
+                  [ ".", "VolumeTotalReadTime", ".", "." ],
+                  [ ".", "VolumeTotalWriteTime", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "EBS Volume Performance",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 8,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${JenkinsBackupFunction}' | fields @timestamp, @message, @logStream\n| filter @message like /INFO/ or @message like /ERROR/ or @message like /WARNING/\n| sort @timestamp desc\n| limit 50",
+                "region": "${AWS::Region}",
+                "title": "Recent Backup Logs (Last 50 entries)",
+                "view": "table"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 14,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Events", "SuccessfulInvocations", "RuleName", "${JenkinsBackupSchedule}" ],
+                  [ ".", "FailedInvocations", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "EventBridge Rule Execution",
+                "period": 3600,
+                "stat": "Sum"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  #============================================================================
+  # STACK OUTPUTS - Information for Users and Integration
+  #============================================================================
+  
+  LambdaFunctionName:
+    Description: 'Name of the Jenkins backup Lambda function'
+    Value: !Ref JenkinsBackupFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-function-name'
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Jenkins backup Lambda function'
+    Value: !GetAtt JenkinsBackupFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-function-arn'
+
+  EventBridgeRuleName:
+    Description: 'Name of the EventBridge schedule rule'
+    Value: !Ref JenkinsBackupSchedule
+    Export:
+      Name: !Sub '${AWS::StackName}-eventbridge-rule'
+
+  BackupSchedule:
+    Description: 'Configured backup schedule'
+    Value: !Sub 'Daily at ${BackupTime} UTC'
+
+  RetentionPolicy:
+    Description: 'Snapshot retention policy'
+    Value: !Sub '${RetentionDays} days'
+
+  JenkinsInstanceId:
+    Description: 'Jenkins EC2 instance being backed up'
+    Value: !Ref JenkinsInstanceId
+
+  SNSTopicArn:
+    Condition: CreateNotifications
+    Description: 'SNS Topic ARN for backup notifications'
+    Value: !Ref BackupNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-sns-topic-arn'
+
+  CloudWatchDashboardURL:
+    Description: 'CloudWatch Dashboard URL for monitoring'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-monitoring'
+
+  ManualTestCommand:
+    Description: 'AWS CLI command to manually test the backup function'
+    Value: !Sub |
+      aws lambda invoke \
+        --function-name ${JenkinsBackupFunction} \
+        --region ${AWS::Region} \
+        --payload '{}' \
+        response.json && cat response.json
+
+  DisasterRecoveryCommand:
+    Description: 'Command to list available snapshots for disaster recovery'
+    Value: !Sub |
+      aws ec2 describe-snapshots \
+        --owner-ids self \
+        --region ${AWS::Region} \
+        --filters "Name=tag:Purpose,Values=Jenkins-Backup" "Name=tag:InstanceId,Values=${JenkinsInstanceId}" \
+        --query 'Snapshots[*].[SnapshotId,StartTime,State,Description]' \
+        --output table
+
+  EstimatedMonthlyCost:
+    Description: 'Estimated monthly cost (varies by volume size and retention)'
+    Value: '$1-5 USD (incremental EBS snapshots + Lambda execution)'
+
+  NextSteps:
+    Description: 'Next steps after deployment'
+    Value: |
+      1. Confirm SNS email subscription (if configured)
+      2. Monitor first backup execution in CloudWatch
+      3. Verify snapshots in EC2 Console
+      4. Test disaster recovery procedures
+      5. Set up billing alerts for EBS snapshots
+
+  RepositoryURL:
+    Description: 'GitHub repository with documentation and examples'
+    Value: 'https://github.com/your-username/jenkins-ebs-backup-automation'
+
+  SupportURL:
+    Description: 'Support and issue tracking'
+    Value: 'https://github.com/your-username/jenkins-ebs-backup-automation/issues'
